@@ -49,3 +49,181 @@ aabという入力に対して上記の正規表現VMを実行する場合、こ
 <img width="630" alt="スクリーンショット 2022-05-29 19 36 41" src="https://user-images.githubusercontent.com/55653825/170863753-6dcf298f-b371-497f-8114-7967f9394cfa.png">
 
 この例では、現在のスレッドが終了するまで新しいスレッドの実行を待ち、作成された順番にスレッドを実行します（古いものから）。これはVMの仕様では要求されていません。スレッドをスケジュールするのは実装次第です。他の実装では、スレッドを別の順番で実行したり、スレッドの実行をインターリーブしたりすることもできます。
+
+## CによるVMインターフェース
+この記事の残りの部分では、VMの一連の実装をCのソースコードを使って説明する。正規表現プログラムはInst構造体の配列として表現され、C言語では次のように定義される。
+
+```c
+enum {    /* Inst.opcode */
+    Char,
+    Match,
+    Jmp,
+    Split
+};
+
+struct Inst {
+    int opcode;
+    int c;
+    Inst *x;
+    Inst *y;
+};
+```
+このバイトコードは、第1回の記事のNFAグラフの表現とほぼ同じである。バイトコードをNFAグラフの機械命令へのエンコードと見ることもできるし、NFAグラフをバイトコードの制御フローグラフと見ることもできる。それぞれの見方によって、考えやすくなることが異なる。この記事では、どちらを先に見たとしても、機械語命令という見方を取り上げます。
+各VMの実装は、プログラムと入力文字列を引数に取り、プログラムが入力文字列にマッチしたかどうかを示す整数を返す関数となる（マッチしない場合は0、マッチした場合は0以外）。
+
+```c
+int implementation(Inst *prog, char *input);
+```
+
+## 再起的なバックトラッキング実装
+最も単純なVMの実装は、スレッドを直接モデル化しません。その代わり、新しいスレッドを探索する必要があるとき、prog と入力関数パラメータが最初のスレッドの pc と sp の初期値として倍増するという事実を利用して、再帰的に自分自身を呼び出す。
+
+```c
+int
+recursive(Inst *pc, char *sp)
+{
+    switch(pc->opcode){
+    case Char:
+        if(*sp != pc->c)
+            return 0;
+        return recursive(pc+1, sp+1);
+    case Match:
+        return 1;
+    case Jmp:
+        return recursive(pc->x, sp);
+    case Split:
+        if(recursive(pc->x, sp))
+            return 1;
+        return recursive(pc->y, sp);
+    }
+    assert(0);
+    return -1;  /* not reached */
+}
+```
+
+上のバージョンは非常に再帰的で、Lisp、ML、Erlangのような再帰を多用する言語に 慣れているプログラマには快適なはずです。ほとんどのCコンパイラは、"return recursive(...);" という文（いわゆる末尾呼び出し）を関数の先頭へのgotoに書き換えるので、上記のコンパイルは以下のようなものになります。
+
+```c
+int
+recursiveloop(Inst *pc, char *sp)
+{
+    for(;;){
+        switch(pc->opcode){
+        case Char:
+            if(*sp != pc->c)
+                return 0;
+            pc++;
+            sp++;
+            continue;
+        case Match:
+            return 1;
+        case Jmp:
+            pc = pc->x;
+            continue;
+        case Split:
+            if(recursiveloop(pc->x, sp))
+                return 1;
+            pc = pc->y;
+            continue;
+        }
+        assert(0);
+        return -1;  /* not reached */
+    }
+}
+```
+
+なお、このバージョンでは、ケースSplitで、pc->yを試す前にpc->xを試すために、まだ1つの（非尾部の）再帰が必要であることに注意してください。
+
+この実装は、Henry Spencerのオリジナルのライブラリや、Java、Perl、PCRE、Pythonのバックトラック実装、オリジナルのed、sed、grepのエッセンスである。この実装は、バックトラックが少ないときは非常に高速に動作するが、前回見たように多くの可能性を試さなければならないときはかなり遅くなる。
+
+(a*)*のような正規表現はコンパイルされたプログラムに無限ループを引き起こす可能性がありますが、このVMの実装ではそのようなループを検出することができません。この問題を解決するのは簡単ですが(詳細は記事の最後を参照)、バックトラックは我々の焦点ではないので、この問題は単に無視することにします。
+
+## 再起しないバックトラッキングの実装
+再帰的バックトラック実装は、1つのスレッドを死ぬまで実行し、その後、スレッドを生成した順序の逆順（新しいものが先）に実行します。実行待ちのスレッドは明示的にエンコードされず、コードが再帰するたびにCのコールスタックに保存されるpcとspの値で暗黙的に処理されます。実行待ちのスレッドが多すぎると、Cコールスタックがオーバーフローし、性能の問題よりもデバッグが困難なエラーが発生する可能性があります。この問題は、各文字の後に新しいスレッドを作成する（上の例ではa+がそうだった）.*のような繰り返しの際に最もよく起こります。これは、スタックサイズに制限があり、スタックオーバーフローをチェックするハードウェアがないことが多い、マルチスレッドプログラムにおける実際の懸念事項です。
+
+C のスタックをオーバーフローさせないようにするには、代わりに明示的なスレッドスタックを維持する必要があります。手始めに、Thread 構造体と単純なコンストラクタ関数 thread を定義します。
+
+```c
+struct Thread {
+    Inst *pc;
+    char *sp;
+};
+
+Thread thread(Inst *pc, char *sp);
+```
+
+そして、VMの実装は、その準備完了リストからスレッドを取り出して、完了まで実行することを繰り返す。1つのスレッドが一致を見つけたら、早期に停止することができる。残りのスレッドを実行する必要はない。すべてのスレッドがマッチを見つけられずに終了した場合、マッチは存在しない。実行待ちのスレッド数には単純な制限があり、制限に達した場合はエラーが報告される。
+
+```c
+int
+backtrackingvm(Inst *prog, char *input)
+{
+    enum { MAXTHREAD = 1000 };
+    Thread ready[MAXTHREAD];
+    int nready;
+    Inst *pc;
+    char *sp;
+
+    /* queue initial thread */
+    ready[0] = thread(prog, input);
+    nready = 1;
+    
+    /* run threads in stack order */
+    while(nready > 0){
+        --nready;  /* pop state for next thread to run */
+        pc = ready[nready].pc;
+        sp = ready[nready].sp;
+        for(;;){
+            switch(pc->opcode){
+            case Char:
+                if(*sp != pc->c)
+                    goto Dead;
+                pc++;
+                sp++;
+                continue;
+            case Match:
+                return 1;
+            case Jmp:
+                pc = pc->x;
+                continue;
+            case Split:
+                if(nready >= MAXTHREAD){
+                    fprintf(stderr, "regexp overflow");
+                    return -1;
+                }
+                /* queue new thread */
+                ready[nready++] = thread(pc->y, sp);
+                pc = pc->x;  /* continue current thread */
+                continue;
+            }
+        }
+    Dead:;
+    }
+    return 0;
+}
+```
+
+この実装は、recursiveやrecursiveloopと同じ動作をする。Cのスタックを使わないだけである。2つのスプリットケースを比較してみましょう。
+
+```c
+/* recursiveloop */
+case Split:
+    if(recursiveloop(pc->x, sp))
+        return 1;
+    pc = pc->y;
+    continue;
+
+	
+/* backtrackingvm */
+case Split:
+    if(nready >= MAXTHREAD){
+        fprintf(stderr, "regexp overflow");
+        return -1;
+    }
+    /* queue new thread */
+    ready[nready++] = thread(pc->y, sp);
+    pc = pc->x;  /* continue current thread */
+    continue;
+```
+
+バックトラックはまだ存在するが、backtrackingvm のコードは recursiveloop が暗黙的に行っていたことを明示的に行わなければならない：再帰の後に使われる PC と SP を保存して、現在のスレッドが失敗したときに試せるようにする。明示的に行うことで、オーバーフローチェックを追加することができる。
